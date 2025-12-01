@@ -1,3 +1,4 @@
+#Main Glue Job Script for MySQL and postgresql to S3 ETL with Multi-threading and CDC Support
 
 import sys
 import boto3
@@ -25,7 +26,25 @@ glueContext = GlueContext(sc)
 spark = glueContext.spark_session
 job = Job(glueContext)
 job.init(args['JOB_NAME'], args)
+def get_secret(secret_name, region_name):
+    # Create a Secrets Manager client
+    session = boto3.session.Session()
+    client = session.client(
+        service_name='secretsmanager',
+        region_name=region_name
+    )
+    try:
+        get_secret_value_response = client.get_secret_value(SecretId=secret_name)
+    except Exception as e:
+        raise e
+    secret = get_secret_value_response['SecretString']
+    return json.loads(secret)
 
+secret_name = "snowflake"         
+region_name = "ap-south-1"
+secret = get_secret(secret_name, region_name)
+sf_user = secret["USERNAME"]
+sf_password = secret["PASSWORD"]
 
 SNOWFLAKE_SOURCE_NAME = "net.snowflake.spark.snowflake"
 sf_url = "vdqiiha-zc94797.snowflakecomputing.com"
@@ -33,8 +52,6 @@ sf_database = "STAGGING"
 sf_schema = "CONFIG"  # <-- Dynamic from Glue job parameter
 sf_warehouse = "DEV_CITADEL_WH"
 sf_role = "DEV_ETL_DEVOPS"
-sf_user = "DEV_ETL_SYS_USER"
-sf_password = "4VX86clTXC5OWc"
 # ------------------------------------------
 # Logging
 # ------------------------------------------
