@@ -6,7 +6,8 @@ import json
 import pytz
 import traceback
 from pyspark.sql import Row
-from datetime import datetime ,timedelta
+from datetime import datetime
+from io import StringIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 from awsglue.utils import getResolvedOptions
@@ -44,19 +45,38 @@ CONNECTION_NAME = args["connection_name"]
 SOURCE_TYPE=args["source_type"]
 jdbc_url=args["jdbc_url"]
 
+def get_secret(secret_name, region_name):
+    # Create a Secrets Manager client
+    session = boto3.session.Session()
+    client = session.client(
+        service_name='secretsmanager',
+        region_name=region_name
+    )
+    try:
+        get_secret_value_response = client.get_secret_value(SecretId=secret_name)
+    except Exception as e:
+        raise e
+    secret = get_secret_value_response['SecretString']
+    return json.loads(secret)
+
+secret_name = "snowflake"         
+region_name = "ap-south-1"
+secret = get_secret(secret_name, region_name)
+sf_user = secret["USERNAME"]
+sf_password = secret["PASSWORD"]
 SNOWFLAKE_SOURCE_NAME = "net.snowflake.spark.snowflake"
 sf_url = "vdqiiha-zc94797.snowflakecomputing.com"
 sf_database = "RAW"
 sf_schema = args["sf_schema"]  # <-- Dynamic from Glue job parameter
 sf_warehouse = "DEV_CITADEL_WH"
 sf_role = "DEV_ETL_DEVOPS"
-sf_user = "DEV_ETL_SYS_USER"
-sf_password = "4VX86clTXC5OWc"
 # ------------------------------------------
 # Logging
 # ------------------------------------------
 logger = glue_context.get_logger()
-
+logger = glue_context.get_logger()
+BUCKET_NAME = "ohl-ganit"
+LOG_PREFIX = "glue-logs"
 
 ist = pytz.timezone("Asia/Kolkata")
 current_time = datetime.now(ist)
@@ -65,20 +85,24 @@ load_hour = current_time.strftime("%H")
 # ------------------------------------------
 # S3 target
 # ------------------------------------------
-BUCKET_NAME = "ohl-ganit"
 if SOURCE_TYPE.lower() == "mysql":
     TARGET_BASE_PATH = f"s3://{BUCKET_NAME}/MySQL/"
     datetime_cast = "DATETIME"
-    user = "ganit_ro_user"
-    password = "72RmpaD426d6VQZrANiD8Hnl"
+    secret_name = "glue_mysql_creds"         
+    region_name = "ap-south-1"
+    secret = get_secret(secret_name, region_name)
+    user = secret["username"]
+    password = secret["password"]
 elif SOURCE_TYPE.lower() == "postgresql":
     TARGET_BASE_PATH = f"s3://{BUCKET_NAME}/PostgreSQL/"
     datetime_cast = "TIMESTAMP"
-    user = "glue_ro_user"
-    password = "5y4umdxep4CNn5yVxHNQttRwb77Vdfzb"
+    secret_name = "glue_postgres_creds"         
+    region_name = "ap-south-1"
+    secret = get_secret(secret_name, region_name)
+    user = secret["username"]
+    password = secret["password"]
 else:
     raise ValueError(f"Unsupported source type: {SOURCE_TYPE}")
-# jdbc_url = "jdbc:mysql://oms-prod.csygmcby9gzi.ap-south-1.rds.amazonaws.com:3306/prod_oms"
 
 # ------------------------------------------
 # DynamoDB metadata table for CDC tracking
@@ -89,28 +113,62 @@ session = boto3.Session(region_name="ap-south-1")
 dynamodb = session.resource("dynamodb")
 run_time_table = dynamodb.Table(RUN_TIME_TABLE)
 load_type_table = dynamodb.Table(LOAD_TYPE_TABLE)
-print("Done:Read all required data !")
+
+def init_s3_logger(bucket_name, database_name, table_name, level=logging.INFO):
+    """Initialize logger that logs to S3 organized by database"""
+    log_stream = StringIO()
+    logger_obj = logging.getLogger(f"{database_name}_{table_name}")
+    logger_obj.setLevel(level)
+
+    # Remove existing handlers to avoid duplicates
+    for handler in logger_obj.handlers[:]:
+        logger_obj.removeHandler(handler)
+
+    handler = logging.StreamHandler(log_stream)
+    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    handler.setFormatter(formatter)
+    logger_obj.addHandler(handler)
+
+    logger_obj.info(f"Logger initialized for {database_name}.{table_name}")
+    return logger_obj, log_stream
+    
+def upload_logs_to_s3(log_stream, bucket_name, database_name, table_name):
+    """Upload logs to S3 organized by database"""
+    try:
+        s3 = boto3.client("s3")
+        timestamp = datetime.now(ist).strftime("%Y-%m-%d_%H%M%S")
+        # Path: logs/{database_name}/{table_name}/{timestamp}/job.log
+        s3_key = f"{LOG_PREFIX}/{database_name}/{table_name}/{timestamp}/job.log"
+
+        s3.put_object(
+            Bucket=bucket_name,
+            Key=s3_key,
+            Body=log_stream.getvalue().encode("utf-8"),
+        )
+        return True
+    except Exception as e:
+        return False
+
 def get_last_run_timestamp(database_name,table_name):
-    print("""Get last run timestamp from DynamoDB.""")
+    """Get last run timestamp from DynamoDB."""
     key = {"database_name": database_name, "table_name": table_name}
     response = run_time_table.get_item(Key=key)
     if "Item" in response:
         logger.info(f"INFO: Item retrieved successfully: {response['Item']}")
-        print("Done:get_last_run_timestamp")
         return response["Item"]["last_updated_on"]
     else:
         raise ValueError(f"ERROR: Item with key {key} does not exist in table {METADATA_TABLE}")
 
 def update_last_run_timestamp(database_name,table_name,last_updated_on):
-    print("""Update last run timestamp after successful run.""")
+    """Update last run timestamp after successful run."""
     run_time_table.update_item(
         Key={"database_name": database_name, "table_name": table_name},
         UpdateExpression="SET last_updated_on = :last_updated_on",
         ExpressionAttributeValues={":last_updated_on": last_updated_on},
         ReturnValues="UPDATED_NEW",
     )
-    print("Done:update_last_run_timestamp")
-def get_incremental_metadata(database_name, table_name):
+   
+def get_incremental_metadata(database_name, table_name,table_logger):
     """
     Fetch incremental column names (incremental_col1, incremental_col2, incremental_col3)
     for a given database.table from DynamoDB table LOAD_TYPE_TABLE.
@@ -120,7 +178,7 @@ def get_incremental_metadata(database_name, table_name):
         response = load_type_table.get_item(Key=key)
 
         if "Item" not in response:
-            logger.warning(f"No incremental metadata found for {database_name}.{table_name}")
+            table_logger.warning(f"No incremental metadata found for {database_name}.{table_name}")
             return None, None, None
 
         item = response["Item"]
@@ -131,27 +189,26 @@ def get_incremental_metadata(database_name, table_name):
         incremental_col2 = incremental_col2.strip() if incremental_col2 else None
         incremental_col3 = incremental_col3.strip() if incremental_col3 else None
 
-        print(f"Incremental cols for {database_name}.{table_name}: "
+        table_logger.info(f"Incremental cols for {database_name}.{table_name}: "
                     f"{incremental_col1}, {incremental_col2}, {incremental_col3}")
-        print("Done:get_incremental_metadata")            
         return incremental_col1, incremental_col2, incremental_col3
 
     except Exception as e:
-        logger.error(f"Error fetching incremental metadata for {database_name}.{table_name}: {str(e)}")
+        table_logger.error(f"Error fetching incremental metadata for {database_name}.{table_name}: {str(e)}")
         traceback.print_exc()
         return None, None, None
 
 # ------------------------------------------
 # Fetch load type mapping from Snowflake
 # ------------------------------------------
-def get_table_load_type_map(database_name):
+def get_table_load_type_map(database_name,job_logger):
     """
     Reads load_type metadata for all tables belonging to a given database
     from DynamoDB and returns a dictionary with keys as (database_name, table_name)
     and values as load_type.
     """
     try:
-        print(f"Fetching load type metadata from DynamoDB for database: {database_name}")
+        job_logger.info(f"Fetching load type metadata from DynamoDB for database: {database_name}")
         # Query using database_name as the partition key
         response = load_type_table.query(
             KeyConditionExpression=boto3.dynamodb.conditions.Key('database_name').eq(database_name)
@@ -177,13 +234,11 @@ def get_table_load_type_map(database_name):
             for item in items
         }
 
-        print(f"Found {len(table_load_type_map)} tables for database '{database_name}'")
-        print(table_load_type_map)
-        print("Done:get_table_load_type_map")
+        job_logger.info(f"Found {len(table_load_type_map)} tables for database '{database_name}'")
         return table_load_type_map
 
     except Exception as e:
-        print(f"Failed to fetch load type metadata from DynamoDB: {str(e)}")
+        job_logger.error(f"Failed to fetch load type metadata from DynamoDB: {str(e)}")
         traceback.print_exc()
         send_slack_notification(DATABASE_NAME, "failed")
         sys.exit(1)
@@ -229,25 +284,26 @@ def send_slack_notification(DATABASE_NAME, status):
     else:
         print("Notification sent successfully.")
 
-def process_table(database_name, table_name, load_type,partition_col,is_partitioned):    
-    print(f"process table function started:{database_name}-{table_name}-{load_type}-{partition_col}-{is_partitioned}")
+def process_table(database_name, table_name, load_type,partition_col,is_partitioned):
+    table_logger, table_log_stream = init_s3_logger(BUCKET_NAME, database_name, table_name)
+    table_logger.info(f"process table function started:{database_name}-{table_name}-{load_type}-{partition_col}-{is_partitioned}")
     try:
-        logger.info(f"[START] ({database_name}.{table_name}) load_type={load_type}")
+        table_logger.info(f"[START] ({database_name}.{table_name}) load_type={load_type}")
         incremental_col1, incremental_col2, incremental_col3 = get_incremental_metadata(database_name, table_name)
         incremental_cols = [col for col in [incremental_col1, incremental_col2, incremental_col3] if col]
 
          # Query logic CAST({col} AS {datetime_cast}) 
         if load_type == "full_load":
             query = f"SELECT * FROM {table_name}"
-            print("Query For Full Load",query)
+            table_logger.info("Query For Full Load",query)
         elif load_type == "cdc_load":
             try:
                 last_updated_on = get_last_run_timestamp(database_name, table_name)
             except Exception as e:
-                logger.warning(f"No DynamoDB entry for {database_name}.{table_name}: {e}")
+                table_logger.warning(f"No DynamoDB entry for {database_name}.{table_name}: {e}")
             if not last_updated_on:
-                logger.info(f"Skipping CDC for {database_name}.{table_name}: No last_updated_on in DynamoDB.")
-                print(f"Skipped CDC for {table_name}: No last_updated_on found in DynamoDB")
+                table_logger.info(f"Skipping CDC for {database_name}.{table_name}: No last_updated_on in DynamoDB.")
+                upload_logs_to_s3(table_log_stream, BUCKET_NAME, database_name, table_name)
                 return ("SKIPPED", database_name, table_name, None)
             try:
                 last_updated_on_dt = datetime.strptime(last_updated_on, "%Y-%m-%d %H:%M:%S.%f")  # With microseconds
@@ -259,11 +315,13 @@ def process_table(database_name, table_name, load_type,partition_col,is_partitio
             if incremental_cols:
                 where_conditions = " OR ".join([f"({col}) > CAST('{last_updated_on_str}' AS {datetime_cast})" for col in incremental_cols])
                 query = f"SELECT * FROM {table_name} WHERE {where_conditions}"
-                print("Query For CDC load",query)
+                table_logger.info("Query For CDC load",query)
             else:
-                logger.warning(f"No incremental columns found for {database_name}.{table_name}. Skipping CDC extraction.")
+                table_logger.info(f"No incremental columns found for {database_name}.{table_name}. Skipping CDC extraction.")
+                upload_logs_to_s3(table_log_stream, BUCKET_NAME, database_name, table_name)
                 return ("SKIPPED", database_name, table_name, None)    
         else:
+            table_logger.error(f"Unknown load_type: {load_type}")
             raise Exception(f"Unknown load_type: {load_type}")
         if is_partitioned=="TRUE":
             NUM_PARTITIONS=10
@@ -283,9 +341,9 @@ def process_table(database_name, table_name, load_type,partition_col,is_partitio
                  if max_val is None:
                      max_val = 0
             except TypeError:
-                print("Warning: Could not determine MIN/MAX bounds. Check if the table is empty.")
+                table_logger.Warning("Warning: Could not determine MIN/MAX bounds. Check if the table is empty.")
                 min_val, max_val = 0, 1
-            print(f"Reading table with numpartition: {table_name}")
+            table_logger.info(f"Reading table with numpartition: {table_name}")
             df= spark.read \
                              .format("jdbc") \
                              .option("url", jdbc_url) \
@@ -300,7 +358,7 @@ def process_table(database_name, table_name, load_type,partition_col,is_partitio
                              .option("zeroDateTimeBehavior", "convertToNull") \
                              .load()        
         else:   
-            print(f"Reading table without numpartition: {table_name}")
+            table_logger.info(f"Reading table without numpartition: {table_name}")
             df = spark.read \
                  .format("jdbc") \
                  .option("url", jdbc_url) \
@@ -309,15 +367,13 @@ def process_table(database_name, table_name, load_type,partition_col,is_partitio
                  .option("password", password) \
                  .option("zeroDateTimeBehavior", "convertToNull") \
                  .load()
-        # target_file_size_mb = 128
-        # estimated_partition_count = int((28 * 1024) / target_file_size_mb)
-        # df = df.repartition(estimated_partition_count)
         df=df.withColumn("insert_timestamp",current_timestamp())
         record_count = df.count()
-        print(f"Record count for {table_name}: {record_count}")
+        table_logger.info(f"Record count for {table_name}: {record_count}")
         #  If no data, skip S3 write & timestamp update
         if record_count == 0:
-            logger.info(f"No new data for {database_name}.{table_name}. Skipping write and timestamp update.")
+            table_logger.info(f"No new data for {database_name}.{table_name}. Skipping write and timestamp update.")
+            upload_logs_to_s3(table_log_stream, BUCKET_NAME, database_name, table_name)
             return ("SUCCESS",database_name, table_name, df)
         
         # target_path = f"{TARGET_BASE_PATH}{database_name}/{table_name}/"
@@ -327,7 +383,7 @@ def process_table(database_name, table_name, load_type,partition_col,is_partitio
         )
         write_mode = "overwrite" if load_type == "full_load" else "append"
         df.write.mode(write_mode).option("compression", "snappy").option("maxRecordsPerFile", "1000000").parquet(target_path)
-        logger.info(f"[DONE] Table {table_name} → {target_path} (mode={write_mode})")
+        table_logger.info(f"[S3 WRITE] Table {table_name} → {target_path} (mode={write_mode})")
         sfOptions = {
         "sfURL": sf_url,
         "sfDatabase": sf_database,
@@ -338,106 +394,119 @@ def process_table(database_name, table_name, load_type,partition_col,is_partitio
         "sfPassword": sf_password,
         }
         df.write.format(SNOWFLAKE_SOURCE_NAME).options(**sfOptions).option("dbtable", table_name.upper()).mode(write_mode).save()
-        print("update timestamp")
+        table_logger.info(f"[SNOWFLAKE WRITE] Completed for {table_name}")
         if incremental_cols:
             agg_exprs = [sp_max(col(c)).alias(c) for c in incremental_cols]
             max_vals = df.agg(*agg_exprs).collect()[0].asDict()
-            # max_ts = max([v for v in max_vals.values() if v is not None])
             non_null_vals = [v for v in max_vals.values() if v is not None]
-            normalized_vals = [to_dt(v) for v in non_null_vals if v is not None] #new added
-            print(f"{table_name},non_null_vals:-{non_null_vals}")
+            normalized_vals = [to_dt(v) for v in non_null_vals if v is not None] 
             max_ts = str(max(normalized_vals)) #new added
             update_last_run_timestamp(database_name,table_name,max_ts)
-            print(f"Updated timestamp for table:{table_name}",max_ts)
-            
+            table_logger.info(f"Updated timestamp for table:{table_name}",max_ts)
+        table_logger.info(f"[SUCCESS] Completed for {table_name}")
+        upload_logs_to_s3(table_log_stream, BUCKET_NAME, database_name, table_name)    
         return ("SUCCESS",database_name,table_name,df)
 
     except Exception as e:
-        logger.error(f"[FAILED] Table {table_name}: {str(e)}")
+        table_logger.error(f"[FAILED] Table {table_name}: {str(e)}")
         traceback.print_exc()
-        print(f"Error For Table :{table_name}")
-        #send_slack_notification(DATABASE_NAME, "failed")
+        send_slack_notification(DATABASE_NAME, "failed")
+        upload_logs_to_s3(table_log_stream, BUCKET_NAME, database_name, table_name)
         raise e
         return {table_name: f"FAILED: {str(e)}"}
 
 # ------------------------------------------
 # Main execution
 # ------------------------------------------
-print("started : Fetching details for table_name and load_type")
-table_load_type_map = get_table_load_type_map(DATABASE_NAME)
-
-print("Prepare list of tables to load") 
-tables_to_load = [
-    (db, tbl, info["load_type"], info["partition_col"], info["is_partitioned"])
-    for (db, tbl), info in table_load_type_map.items()
-]
-# ex_tables = {
-#     "partners",
-# }
-
-# filtered_tables_to_load = [
-#     (db, tbl, load_type,partition_col,is_partitioned)
-#     for (db, tbl, load_type,partition_col,is_partitioned) in tables_to_load
-#     if tbl not in ex_tables
-# ]
-# print(filtered_tables_to_load)
-results = []
-with ThreadPoolExecutor(max_workers=THREAD_COUNT) as executor:
-    futures = {executor.submit(process_table , db, tbl, load_type,partition_col,is_partitioned): (db, tbl,load_type,partition_col,is_partitioned)
-        for db, tbl, load_type , partition_col , is_partitioned in tables_to_load}
-    for future in as_completed(futures):
-        status,database_name,table_name, df = future.result()
-        if df is not None:
-            row_count = df.count()
-            print(f"Finished reading: {table_name} (Rows: {row_count})")
-        else:
-            row_count = 0 
-            print(f"Skipped table: {table_name} (No data loaded)")
-        results.append((status,database_name,table_name,row_count))
-
-print("All threads completed. Summary:")
-audit_rows = []
-audit_time = datetime.now(ist)
-for (status, db, tbl, row_count) in results:
-    audit_rows.append(
-        Row(
-            database_name=db,
-            table_name=tbl,
-            layer="RAW",
-            status=status,
-            row_count=(row_count),
-            inserted_at=audit_time
+job_logger, job_log_stream = init_s3_logger(BUCKET_NAME, DATABASE_NAME, "JOB_SUMMARY")
+try:
+    job_logger.info("=" * 60)
+    job_logger.info(f"Starting Glue ETL Job for Database: {DATABASE_NAME}")
+    job_logger.info(f"Source Type: {SOURCE_TYPE}, Thread Count: {THREAD_COUNT}")
+    job_logger.info("=" * 60)
+    table_load_type_map = get_table_load_type_map(DATABASE_NAME, job_logger)
+    tables_to_load = [
+        (db, tbl, info["load_type"], info["partition_col"], info["is_partitioned"])
+        for (db, tbl), info in table_load_type_map.items()
+    ]
+    job_logger.info(f"Total tables to process: {len(tables_to_load)}")
+    results = []
+    with ThreadPoolExecutor(max_workers=THREAD_COUNT) as executor:
+        futures = {
+            executor.submit(process_table, db, tbl, load_type, partition_col, is_partitioned): (db, tbl, load_type, partition_col, is_partitioned)
+            for db, tbl, load_type, partition_col, is_partitioned in tables_to_load
+        }
+        for future in as_completed(futures):
+            try:
+                status, database_name, table_name, df = future.result()
+                if df is not None:
+                    row_count = df.count()
+                    job_logger.info(f"Finished reading: {table_name} (Rows: {row_count})")
+                else:
+                    row_count = 0 
+                    job_logger.info(f"Skipped table: {table_name} (No data loaded)")
+                results.append((status, database_name, table_name, row_count))
+            except Exception as e:
+                job_logger.error(f"Thread error: {str(e)}")
+                raise
+    job_logger.info("All threads completed. Creating audit summary...")
+    
+    # Create audit records
+    audit_rows = []
+    audit_time = datetime.now(ist)
+    for (status, db, tbl, row_count) in results:
+        audit_rows.append(
+            Row(
+                database_name=db,
+                table_name=tbl,
+                layer="RAW",
+                status=status,
+                row_count=(row_count),
+                inserted_at=audit_time
+            )
         )
-    )
-schema = StructType([
-    StructField("DATABASE_NAME", StringType(), True),
-    StructField("TABLE_NAME", StringType(), True),
-    StructField("LAYER", StringType(), True),
-    StructField("STATUS", StringType(), True),
-    StructField("ROW_COUNT", IntegerType(), True),
-    StructField("INSERTED_AT", TimestampType(), True)
-])    
-audit_df = spark.createDataFrame(audit_rows,schema)
-audit_df.show()
-sfOptions = {
-    "sfURL": sf_url,
-    "sfDatabase": "AUDIT",
-    "sfSchema": "AUDIT_PROGRAM",
-    "sfWarehouse": sf_warehouse, #update object
-    "sfRole": sf_role,
-    "sfUser": sf_user,
-    "sfPassword": sf_password,
-}
-audit_df.write \
-    .format("net.snowflake.spark.snowflake") \
-    .options(**sfOptions) \
-    .option("dbtable", "ETL_AUDIT_LOG") \
-    .mode("append") \
-    .save()
-#send_slack_notification(DATABASE_NAME, "success")
-print("✅ Audit data written to Snowflake table: ETL_AUDIT_LOG")
-for res in results:
-    print(res)
-print("TOTAL TABLE WRITTEN:",len(results))
+        job_logger.info(f"  {db}.{tbl}: {status} ({row_count} rows)")
+        
+    schema = StructType([
+        StructField("DATABASE_NAME", StringType(), True),
+        StructField("TABLE_NAME", StringType(), True),
+        StructField("LAYER", StringType(), True),
+        StructField("STATUS", StringType(), True),
+        StructField("ROW_COUNT", IntegerType(), True),
+        StructField("INSERTED_AT", TimestampType(), True)
+    ])    
+    audit_df = spark.createDataFrame(audit_rows, schema)
+    
+    sfOptions = {
+        "sfURL": sf_url,
+        "sfDatabase": "AUDIT",
+        "sfSchema": "AUDIT_PROGRAM",
+        "sfWarehouse": sf_warehouse,
+        "sfRole": sf_role,
+        "sfUser": sf_user,
+        "sfPassword": sf_password,
+    }
+    audit_df.write \
+        .format(SNOWFLAKE_SOURCE_NAME) \
+        .options(**sfOptions) \
+        .option("dbtable", "ETL_AUDIT_LOG") \
+        .mode("append") \
+        .save()
+        
+    job_logger.info("Audit data written to Snowflake table: ETL_AUDIT_LOG")
+    
+    job_logger.info("=" * 60)
+    job_logger.info(f"Job completed successfully for {DATABASE_NAME}!")
+    job_logger.info("=" * 60)
+    
+except Exception as e:
+    job_logger.error(f"\nJob failed with error: {str(e)}")
+    job_logger.exception(traceback.format_exc())
+    # Send failure notification
+    send_slack_notification(DATABASE_NAME, "failed")
+    raise e
 
+finally:
+    # Upload job summary logs to S3
+    upload_logs_to_s3(job_log_stream, BUCKET_NAME, DATABASE_NAME, "JOB_SUMMARY")
 job.commit()
