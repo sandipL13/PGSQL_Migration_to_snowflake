@@ -289,7 +289,7 @@ def process_table(database_name, table_name, load_type,partition_col,is_partitio
     table_logger.info(f"process table function started:{database_name}-{table_name}-{load_type}-{partition_col}-{is_partitioned}")
     try:
         table_logger.info(f"[START] ({database_name}.{table_name}) load_type={load_type}")
-        incremental_col1, incremental_col2, incremental_col3 = get_incremental_metadata(database_name, table_name)
+        incremental_col1, incremental_col2, incremental_col3 = get_incremental_metadata(database_name, table_name,table_logger)
         incremental_cols = [col for col in [incremental_col1, incremental_col2, incremental_col3] if col]
 
          # Query logic CAST({col} AS {datetime_cast}) 
