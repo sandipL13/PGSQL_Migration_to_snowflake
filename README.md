@@ -50,7 +50,8 @@ The output forms the high-quality curated dataset for analytics and downstream c
 ----------------------------------------------------------------------------------------------------
 S3 Folder structure:
 1. BUCKET_NAME 
-        -SOURCE_DB_NAME
+    -SOURCE
+        -DB_NAME
             -TABLE_NAME
                 -DATE
                     -HOUR
