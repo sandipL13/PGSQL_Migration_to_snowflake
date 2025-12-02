@@ -295,7 +295,7 @@ def process_table(database_name, table_name, load_type,partition_col,is_partitio
          # Query logic CAST({col} AS {datetime_cast}) 
         if load_type == "full_load":
             query = f"SELECT * FROM {table_name}"
-            table_logger.info("Query For Full Load",query)
+            table_logger.info(f"Query For Full Load {query}")
         elif load_type == "cdc_load":
             try:
                 last_updated_on = get_last_run_timestamp(database_name, table_name)
@@ -315,7 +315,7 @@ def process_table(database_name, table_name, load_type,partition_col,is_partitio
             if incremental_cols:
                 where_conditions = " OR ".join([f"({col}) > CAST('{last_updated_on_str}' AS {datetime_cast})" for col in incremental_cols])
                 query = f"SELECT * FROM {table_name} WHERE {where_conditions}"
-                table_logger.info("Query For CDC load",query)
+                table_logger.info(f"Query For CDC load ,{query}")
             else:
                 table_logger.info(f"No incremental columns found for {database_name}.{table_name}. Skipping CDC extraction.")
                 upload_logs_to_s3(table_log_stream, BUCKET_NAME, database_name, table_name)
