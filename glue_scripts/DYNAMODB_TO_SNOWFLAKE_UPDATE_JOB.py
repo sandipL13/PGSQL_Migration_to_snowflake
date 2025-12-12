@@ -50,8 +50,8 @@ SNOWFLAKE_SOURCE_NAME = "net.snowflake.spark.snowflake"
 sf_url = "vdqiiha-zc94797.snowflakecomputing.com"
 sf_database = "STAGGING"
 sf_schema = "CONFIG"  # <-- Dynamic from Glue job parameter
-sf_warehouse = "DEV_CITADEL_WH"
-sf_role = "DEV_ETL_DEVOPS"
+sf_warehouse = "PRD_INGESTION_WH"
+sf_role = "PRD_ETL_DEVOPS"
 # ------------------------------------------
 # Logging
 # ------------------------------------------

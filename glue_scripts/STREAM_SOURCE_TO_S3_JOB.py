@@ -68,8 +68,8 @@ SNOWFLAKE_SOURCE_NAME = "net.snowflake.spark.snowflake"
 sf_url = "vdqiiha-zc94797.snowflakecomputing.com"
 sf_database = "RAW"
 sf_schema = args["sf_schema"]  # <-- Dynamic from Glue job parameter
-sf_warehouse = "DEV_CITADEL_WH"
-sf_role = "DEV_ETL_DEVOPS"
+sf_warehouse = "PRD_INGESTION_WH"
+sf_role = "PRD_ETL_DEVOPS"
 # ------------------------------------------
 # Logging
 # ------------------------------------------
@@ -160,14 +160,19 @@ def get_last_run_timestamp(database_name,table_name):
         raise ValueError(f"ERROR: Item with key {key} does not exist in table {METADATA_TABLE}")
 
 def update_last_run_timestamp(database_name,table_name,last_updated_on):
+    
     """Update last run timestamp after successful run."""
-    run_time_table.update_item(
-        Key={"database_name": database_name, "table_name": table_name},
-        UpdateExpression="SET last_updated_on = :last_updated_on",
-        ExpressionAttributeValues={":last_updated_on": last_updated_on},
-        ReturnValues="UPDATED_NEW",
-    )
-   
+    try:
+        run_time_table.update_item(
+         Key={"database_name": database_name, "table_name": table_name},
+         UpdateExpression="SET last_updated_on = :last_updated_on",
+         ExpressionAttributeValues={":last_updated_on": last_updated_on},
+         ReturnValues="UPDATED_NEW",
+        )
+    except Exception as e:
+        send_slack_notification(DATABASE_NAME, "UPDATE TIMESTAMP FAILED")
+        raise e
+
 def get_incremental_metadata(database_name, table_name,table_logger):
     """
     Fetch incremental column names (incremental_col1, incremental_col2, incremental_col3)
@@ -295,6 +300,7 @@ def process_table(database_name, table_name, load_type,partition_col,is_partitio
          # Query logic CAST({col} AS {datetime_cast}) 
         if load_type == "full_load":
             query = f"SELECT * FROM {table_name}"
+            min_max_query = f"(SELECT MIN({partition_col}) AS min_val, MAX({partition_col}) AS max_val FROM {table_name}) AS bounds"
             table_logger.info(f"Query For Full Load {query}")
         elif load_type == "cdc_load":
             try:
@@ -309,12 +315,13 @@ def process_table(database_name, table_name, load_type,partition_col,is_partitio
                 last_updated_on_dt = datetime.strptime(last_updated_on, "%Y-%m-%d %H:%M:%S.%f")  # With microseconds
             except ValueError:
                 last_updated_on_dt = datetime.strptime(last_updated_on, "%Y-%m-%d %H:%M:%S")
-            last_updated_on_dt = last_updated_on_dt - timedelta(minutes=30)    
+            last_updated_on_dt = last_updated_on_dt - timedelta(minutes=5)    
             last_updated_on_trunc = last_updated_on_dt.replace(second=0, microsecond=0)
             last_updated_on_str = last_updated_on_trunc.strftime("%Y-%m-%d %H:%M:%S")      
             if incremental_cols:
                 where_conditions = " OR ".join([f"({col}) > CAST('{last_updated_on_str}' AS {datetime_cast})" for col in incremental_cols])
                 query = f"SELECT * FROM {table_name} WHERE {where_conditions}"
+                min_max_query = f"(SELECT MIN({partition_col}) AS min_val, MAX({partition_col}) AS max_val FROM {table_name} WHERE {where_conditions}) AS bounds"
                 table_logger.info(f"Query For CDC load {query}")
             else:
                 table_logger.info(f"No incremental columns found for {database_name}.{table_name}. Skipping CDC extraction.")
@@ -325,7 +332,7 @@ def process_table(database_name, table_name, load_type,partition_col,is_partitio
             raise Exception(f"Unknown load_type: {load_type}")
         if is_partitioned=="TRUE":
             NUM_PARTITIONS=2
-            min_max_query = f"(SELECT MIN({partition_col}) AS min_val, MAX({partition_col}) AS max_val FROM {table_name}) AS bounds"
+            #min_max_query = f"(SELECT MIN({partition_col}) AS min_val, MAX({partition_col}) AS max_val FROM {table_name}) AS bounds"
             bounds_df = spark.read \
                         .format("jdbc") \
                         .option("url", jdbc_url) \
@@ -344,6 +351,10 @@ def process_table(database_name, table_name, load_type,partition_col,is_partitio
                 table_logger.Warning("Warning: Could not determine MIN/MAX bounds. Check if the table is empty.")
                 min_val, max_val = 0, 1
             table_logger.info(f"Reading table with numpartition: {table_name}")
+            if database_name=='prod_scheduler_api':
+                batch_size=1000
+            else:
+                batch_size=10000
             df= spark.read \
                              .format("jdbc") \
                              .option("url", jdbc_url) \
@@ -354,7 +365,7 @@ def process_table(database_name, table_name, load_type,partition_col,is_partitio
                              .option("lowerBound", int(min_val)) \
                              .option("upperBound", int(max_val)) \
                              .option("numPartitions", NUM_PARTITIONS) \
-                             .option("fetchsize", 10000) \
+                             .option("fetchsize", batch_size) \
                              .option("zeroDateTimeBehavior", "convertToNull") \
                              .load()        
         else:   
@@ -396,13 +407,18 @@ def process_table(database_name, table_name, load_type,partition_col,is_partitio
         df.write.format(SNOWFLAKE_SOURCE_NAME).options(**sfOptions).option("dbtable", table_name.upper()).mode(write_mode).save()
         table_logger.info(f"[SNOWFLAKE WRITE] Completed for {table_name}")
         if incremental_cols:
-            agg_exprs = [sp_max(col(c)).alias(c) for c in incremental_cols]
-            max_vals = df.agg(*agg_exprs).collect()[0].asDict()
-            non_null_vals = [v for v in max_vals.values() if v is not None]
-            normalized_vals = [to_dt(v) for v in non_null_vals if v is not None] 
-            max_ts = str(max(normalized_vals)) #new added
-            update_last_run_timestamp(database_name,table_name,max_ts)
-            table_logger.info(f"Updated timestamp for table:{table_name}",max_ts)
+            try:
+                agg_exprs = [sp_max(col(c)).alias(c) for c in incremental_cols]
+                max_vals = df.agg(*agg_exprs).collect()[0].asDict()
+                non_null_vals = [v for v in max_vals.values() if v is not None]
+                normalized_vals = [to_dt(v) for v in non_null_vals if v is not None] 
+                max_ts = str(max(normalized_vals)) #new added
+                update_last_run_timestamp(database_name,table_name,max_ts)
+                table_logger.info(f"Updated timestamp for table:{table_name},{max_ts}")
+            except Exception as e:
+                table_logger.error(f"[UPDATE TIMESTAMP BLOCK FAILED] Error while updating timestamp for {table_name}: {e}")
+                send_slack_notification(DATABASE_NAME, "UPDATE TIMESTAMP FAILED")
+                raise e
         table_logger.info(f"[SUCCESS] Completed for {table_name}")
         upload_logs_to_s3(table_log_stream, BUCKET_NAME, database_name, table_name)    
         return ("SUCCESS",database_name,table_name,df)
@@ -426,8 +442,9 @@ try:
     job_logger.info("=" * 60)
     table_load_type_map = get_table_load_type_map(DATABASE_NAME, job_logger)
     tables_to_load = [
-        (db, tbl, info["load_type"], info["partition_col"], info["is_partitioned"])
-        for (db, tbl), info in table_load_type_map.items()
+            (db, tbl, info["load_type"], info["partition_col"], info["is_partitioned"])
+            for (db, tbl), info in table_load_type_map.items()
+            if info["load_type"] in ("full_load", "cdc_load")
     ]
     job_logger.info(f"Total tables to process: {len(tables_to_load)}")
     results = []
